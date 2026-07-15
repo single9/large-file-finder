@@ -406,8 +406,10 @@ impl App {
                 entry.size = dir_size_to_size(dir_size);
             }
         }
+        let target = self.cursor_target();
         self.sort_entries();
         self.apply_filter();
+        self.restore_cursor(target);
     }
 
     fn pending_count(&self) -> usize {
@@ -419,6 +421,33 @@ impl App {
 
     fn selected_entry(&self) -> Option<&Entry> {
         self.filtered.get(self.cursor).map(|&i| &self.entries[i])
+    }
+
+    /// Path of the entry currently under the cursor, captured before a
+    /// re-sort/re-filter so it can be re-located afterward — without this,
+    /// `self.cursor` (a bare index) can end up silently pointing at a
+    /// different entry once the list reorders (e.g. a background directory
+    /// size arriving), which is dangerous right before a delete.
+    fn cursor_target(&self) -> Option<PathBuf> {
+        self.filtered
+            .get(self.cursor)
+            .map(|&i| self.entries[i].path.clone())
+    }
+
+    /// Re-points the cursor at `target` if it's still present in the current
+    /// `filtered` list; otherwise leaves the clamped value `apply_filter`
+    /// already set.
+    fn restore_cursor(&mut self, target: Option<PathBuf>) {
+        let Some(target) = target else {
+            return;
+        };
+        if let Some(pos) = self
+            .filtered
+            .iter()
+            .position(|&i| self.entries[i].path == target)
+        {
+            self.cursor = pos;
+        }
     }
 
     fn entries_to_delete(&self) -> Vec<usize> {
@@ -519,6 +548,7 @@ impl App {
                 self.clean_menu_cursor = 0;
             }
             KeyCode::Char('s') => {
+                let target = self.cursor_target();
                 self.sort_mode = match self.sort_mode {
                     SortMode::SizeDesc => SortMode::SizeAsc,
                     SortMode::SizeAsc => SortMode::NameAsc,
@@ -526,8 +556,10 @@ impl App {
                 };
                 self.sort_entries();
                 self.apply_filter();
+                self.restore_cursor(target);
             }
             KeyCode::Char('r') => {
+                let target = self.cursor_target();
                 match self.view {
                     ViewKind::Explorer => {
                         self.size_cache
@@ -540,6 +572,7 @@ impl App {
                     }
                 }
                 self.refresh_view();
+                self.restore_cursor(target);
             }
             _ => {}
         }
@@ -672,22 +705,30 @@ impl App {
 
     fn start_delete(&mut self) {
         let indices = self.entries_to_delete();
-        let targets: Vec<(PathBuf, bool, String)> = indices
-            .iter()
-            .map(|&i| {
-                let e = &self.entries[i];
-                (e.path.clone(), e.is_dir, e.name.clone())
-            })
-            .collect();
+        let mut targets: Vec<(PathBuf, bool, String)> = Vec::new();
+        let mut blocked = 0;
+        for &i in &indices {
+            let e = &self.entries[i];
+            // A filesystem root has no parent; never allow it to be deleted,
+            // regardless of how its path was constructed.
+            if e.path.parent().is_none() {
+                blocked += 1;
+                continue;
+            }
+            targets.push((e.path.clone(), e.is_dir, e.name.clone()));
+        }
         let total = targets.len();
         if total == 0 {
+            if blocked > 0 {
+                self.status = "refused to delete a filesystem root".to_string();
+            }
             return;
         }
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut deleted = 0;
-            let mut failed = 0;
+            let mut failed = blocked;
             for (done, (path, is_dir, name)) in targets.into_iter().enumerate() {
                 let _ = tx.send(DeleteMsg::Progress { done, total, name });
                 let result = if is_dir {
@@ -937,9 +978,15 @@ impl App {
                     .iter()
                     .map(|&i| size_value(&self.entries[i].size))
                     .sum();
+                let target = match indices.as_slice() {
+                    [] => String::new(),
+                    [i] => format!("\"{}\"", self.entries[*i].name),
+                    [first, rest @ ..] => {
+                        format!("\"{}\" (+{} more)", self.entries[*first].name, rest.len())
+                    }
+                };
                 format!(
-                    "delete {} item(s), {} total? (y/n)",
-                    indices.len(),
+                    "delete {target}, {} total? (y/n)",
                     format_size(total, DECIMAL)
                 )
             }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A named cache/temp location we know how to look for. `exists` filters candidates
 /// down to what's actually present, so listing wrong guesses for other platforms or
@@ -22,6 +22,19 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(windows)]
 fn local_app_data() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+}
+
+/// Rejects candidate paths that would be catastrophic to offer for deletion:
+/// relative paths (a sign the source env var was empty), filesystem roots
+/// (`path.parent()` is `None` on both Unix `/` and Windows `C:\`), and the
+/// home directory itself. `std::env::temp_dir()` in particular is used
+/// unvalidated and returns exactly these values when `$TMPDIR` is empty or
+/// set to `/`.
+fn is_dangerous_candidate(path: &Path) -> bool {
+    if !path.is_absolute() || path.parent().is_none() {
+        return true;
+    }
+    home_dir().is_some_and(|home| path == home)
 }
 
 /// Caches produced by AI/ML tools: model hubs, local inference runtimes, and
@@ -101,6 +114,7 @@ pub fn ai_cache_candidates() -> Vec<CacheEntry> {
         });
     }
 
+    v.retain(|c| !is_dangerous_candidate(&c.path));
     v
 }
 
@@ -151,5 +165,6 @@ pub fn system_cache_candidates() -> Vec<CacheEntry> {
         });
     }
 
+    v.retain(|c| !is_dangerous_candidate(&c.path));
     v
 }
