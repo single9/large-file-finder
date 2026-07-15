@@ -60,6 +60,17 @@ struct Entry {
     selected: bool,
 }
 
+/// A selection persists across navigation (unlike `Entry`, which is rebuilt
+/// from scratch every time a directory or cache view loads), so items picked
+/// in different folders can be reviewed and deleted together in one batch.
+#[derive(Clone)]
+struct SelectedItem {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum SortMode {
     SizeDesc,
@@ -210,6 +221,14 @@ struct App {
     clean_menu_cursor: usize,
     delete_rx: Option<Receiver<DeleteMsg>>,
     delete_progress: Option<DeleteProgress>,
+    /// Cross-folder selection, built up by pressing space in any directory
+    /// or cache view; survives navigation until deleted or toggled off.
+    selection: Vec<SelectedItem>,
+    /// Snapshot of what's about to be deleted, captured when entering
+    /// `Mode::ConfirmDelete` so the review screen and the actual delete
+    /// operate on the same fixed list even if the user keeps browsing after
+    /// cancelling.
+    pending_delete: Vec<SelectedItem>,
 }
 
 impl App {
@@ -235,6 +254,8 @@ impl App {
             clean_menu_cursor: 0,
             delete_rx: None,
             delete_progress: None,
+            selection: Vec::new(),
+            pending_delete: Vec::new(),
         };
         app.load_dir();
         app
@@ -295,8 +316,18 @@ impl App {
             }
         }
 
+        self.hydrate_selection();
         self.sort_entries();
         self.apply_filter();
+    }
+
+    /// Marks freshly-loaded entries as selected if they're already part of
+    /// the persistent cross-folder selection, so checkboxes stay accurate
+    /// when re-visiting a directory.
+    fn hydrate_selection(&mut self) {
+        for entry in &mut self.entries {
+            entry.selected = self.selection.iter().any(|s| s.path == entry.path);
+        }
     }
 
     fn load_cache_candidates(&mut self, category: CacheCategory) {
@@ -340,6 +371,7 @@ impl App {
             });
         }
 
+        self.hydrate_selection();
         self.sort_entries();
         self.apply_filter();
     }
@@ -405,6 +437,9 @@ impl App {
             if let Some(entry) = self.entries.iter_mut().find(|e| e.path == path) {
                 entry.size = dir_size_to_size(dir_size);
             }
+            if let Some(selected) = self.selection.iter_mut().find(|s| s.path == path) {
+                selected.size = size_value(&dir_size_to_size(dir_size));
+            }
         }
         let target = self.cursor_target();
         self.sort_entries();
@@ -450,20 +485,24 @@ impl App {
         }
     }
 
-    fn entries_to_delete(&self) -> Vec<usize> {
-        let selected: Vec<usize> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.selected)
-            .map(|(i, _)| i)
-            .collect();
-        if !selected.is_empty() {
-            return selected;
+    /// The items a delete would act on: the cross-folder selection if
+    /// anything's been picked with space, otherwise just the entry under the
+    /// cursor (single-item quick delete).
+    fn delete_candidates(&self) -> Vec<SelectedItem> {
+        if !self.selection.is_empty() {
+            return self.selection.clone();
         }
         self.filtered
             .get(self.cursor)
-            .copied()
+            .map(|&i| {
+                let e = &self.entries[i];
+                SelectedItem {
+                    path: e.path.clone(),
+                    name: e.name.clone(),
+                    is_dir: e.is_dir,
+                    size: size_value(&e.size),
+                }
+            })
             .into_iter()
             .collect()
     }
@@ -529,19 +568,20 @@ impl App {
                 if self.delete_progress.is_some() {
                     return;
                 }
-                let indices = self.entries_to_delete();
-                if indices.is_empty() {
+                let candidates = self.delete_candidates();
+                if candidates.is_empty() {
                     return;
                 }
-                if let Some(&i) = indices
+                if let Some(item) = candidates
                     .iter()
-                    .find(|&&i| crate::cache_paths::is_protected_path(&self.entries[i].path))
+                    .find(|c| crate::cache_paths::is_protected_path(&c.path))
                 {
                     self.status = format!(
                         "refused: \"{}\" is a protected system location and cannot be removed",
-                        self.entries[i].name
+                        item.name
                     );
                 } else {
+                    self.pending_delete = candidates;
                     self.mode = Mode::ConfirmDelete;
                 }
             }
@@ -648,8 +688,22 @@ impl App {
     }
 
     fn toggle_select(&mut self) {
-        if let Some(&i) = self.filtered.get(self.cursor) {
-            self.entries[i].selected = !self.entries[i].selected;
+        let Some(&i) = self.filtered.get(self.cursor) else {
+            return;
+        };
+        let path = self.entries[i].path.clone();
+        if let Some(pos) = self.selection.iter().position(|s| s.path == path) {
+            self.selection.remove(pos);
+            self.entries[i].selected = false;
+        } else {
+            let e = &self.entries[i];
+            self.selection.push(SelectedItem {
+                path: e.path.clone(),
+                name: e.name.clone(),
+                is_dir: e.is_dir,
+                size: size_value(&e.size),
+            });
+            self.entries[i].selected = true;
         }
     }
 
@@ -714,24 +768,32 @@ impl App {
                 self.start_delete();
                 self.mode = Mode::Normal;
             }
-            _ => self.mode = Mode::Normal,
+            _ => {
+                self.pending_delete.clear();
+                self.mode = Mode::Normal;
+            }
         }
     }
 
     fn start_delete(&mut self) {
-        let indices = self.entries_to_delete();
+        let items = std::mem::take(&mut self.pending_delete);
+        // The whole cross-folder selection is being resolved by this delete
+        // (whether it succeeds, partially fails, or was reached via the
+        // cursor-fallback path) — clear it now so re-visited directories
+        // don't keep showing stale checkboxes.
+        self.selection.clear();
+
         let mut targets: Vec<(PathBuf, bool, String)> = Vec::new();
         let mut blocked = 0;
-        for &i in &indices {
-            let e = &self.entries[i];
+        for item in items {
             // Belt-and-suspenders: the 'd' key handler already refuses to
             // enter ConfirmDelete for a protected path, but never delete one
             // here either, regardless of how a target path was constructed.
-            if crate::cache_paths::is_protected_path(&e.path) {
+            if crate::cache_paths::is_protected_path(&item.path) {
                 blocked += 1;
                 continue;
             }
-            targets.push((e.path.clone(), e.is_dir, e.name.clone()));
+            targets.push((item.path, item.is_dir, item.name));
         }
         let total = targets.len();
         if total == 0 {
@@ -809,6 +871,7 @@ impl App {
         match self.mode {
             Mode::CleanMenu => self.draw_clean_menu(f, layout[1]),
             Mode::Help => self.draw_help(f, layout[1]),
+            Mode::ConfirmDelete => self.draw_delete_review(f, layout[1]),
             _ => self.draw_list(f, layout[1]),
         }
         self.draw_status(f, layout[2]);
@@ -825,22 +888,30 @@ impl App {
         };
 
         let pending = self.pending_count();
+        let mut spans = vec![Span::styled(
+            path_text,
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        if !self.selection.is_empty() && !matches!(self.mode, Mode::ConfirmDelete) {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("{} selected across folders", self.selection.len()),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         let line = if pending > 0 {
             const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
             let frame = SPINNER[self.spinner_tick % SPINNER.len()];
-            Line::from(vec![
-                Span::styled(path_text, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(
-                    format!("{frame} scanning… ({pending} pending)"),
-                    Style::default().fg(Color::Green),
-                ),
-            ])
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("{frame} scanning… ({pending} pending)"),
+                Style::default().fg(Color::Green),
+            ));
+            Line::from(spans)
         } else {
-            Line::from(Span::styled(
-                path_text,
-                Style::default().add_modifier(Modifier::BOLD),
-            ))
+            Line::from(spans)
         };
         f.render_widget(Paragraph::new(line), area);
     }
@@ -910,6 +981,44 @@ impl App {
         f.render_stateful_widget(table, area, &mut state);
     }
 
+    /// Read-only final review of everything about to be deleted — the whole
+    /// point of letting selections span multiple folders is that the user
+    /// can no longer see them all in one screen while browsing, so this is
+    /// the one place that lists every target together before it's too late.
+    fn draw_delete_review(&self, f: &mut Frame, area: Rect) {
+        let rows: Vec<Row> = self
+            .pending_delete
+            .iter()
+            .map(|item| {
+                let icon = if item.is_dir { "📁" } else { "📄" };
+                Row::new(vec![
+                    Cell::from(icon),
+                    Cell::from(item.name.clone()),
+                    Cell::from(
+                        Line::from(format_size(item.size, DECIMAL)).alignment(Alignment::Right),
+                    ),
+                ])
+            })
+            .collect();
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(14),
+            ],
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title("Confirm delete — review before you press y"),
+        );
+
+        f.render_widget(table, area);
+    }
+
     fn draw_clean_menu(&self, f: &mut Frame, area: Rect) {
         let lines: Vec<Line> = CacheCategory::ALL
             .iter()
@@ -952,7 +1061,10 @@ impl App {
             ),
             (
                 "Select & remove",
-                &[("space", "select"), ("d, delete", "delete selection")],
+                &[
+                    ("space", "select (persists across folders)"),
+                    ("d, delete", "review & delete selection"),
+                ],
             ),
             (
                 "View",
@@ -999,20 +1111,10 @@ impl App {
             Mode::CleanMenu => String::new(),
             Mode::Help => String::new(),
             Mode::ConfirmDelete => {
-                let indices = self.entries_to_delete();
-                let total: u64 = indices
-                    .iter()
-                    .map(|&i| size_value(&self.entries[i].size))
-                    .sum();
-                let target = match indices.as_slice() {
-                    [] => String::new(),
-                    [i] => format!("\"{}\"", self.entries[*i].name),
-                    [first, rest @ ..] => {
-                        format!("\"{}\" (+{} more)", self.entries[*first].name, rest.len())
-                    }
-                };
+                let total: u64 = self.pending_delete.iter().map(|i| i.size).sum();
                 format!(
-                    "delete {target}, {} total? (y/n)",
+                    "delete these {} item(s), {} total — permanent, cannot be undone (y/n)",
+                    self.pending_delete.len(),
                     format_size(total, DECIMAL)
                 )
             }

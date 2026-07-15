@@ -49,8 +49,8 @@ with a `+` suffix.
 | `g` | Go to path |
 | `/` | Filter by name |
 | `m` | Filter by minimum size |
-| `space` | Select |
-| `d`, `delete` | Delete selection (or the item under the cursor), with confirmation |
+| `space` | Select — persists as you navigate, so you can pick items across multiple folders |
+| `d`, `delete` | Review everything selected (across all folders) in one screen, then delete on confirmation |
 | `s` | Cycle sort (size ↓, size ↑, name) |
 | `r` | Refresh |
 | `c` | Clean caches & temp files |

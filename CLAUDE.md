@@ -30,9 +30,19 @@ min-size filter), `-n/--limit` (`--list` mode only), `--follow-links`, `--list`.
   in red) and cannot be entered/deleted-into; a directory that's readable but has unreadable descendants
   partway through the walk is `Size::Partial` (size is a lower bound, shown with a `+` suffix) rather than
   being dropped from the listing — nothing is silently excluded from view.
-- Deletion (`d`) targets the selection set if non-empty, otherwise falls back to the entry under the
-  cursor (`entries_to_delete`), and always goes through a `ConfirmDelete` mode before calling
-  `fs::remove_file`/`fs::remove_dir_all`.
+- **Cross-folder selection**: `App.selection: Vec<SelectedItem>` is the persistent source of truth for
+  what's picked with `space` — unlike `entries`, it survives navigation, so items chosen in different
+  directories accumulate into one selection. `Entry.selected` is just a per-directory display mirror,
+  re-derived from `selection` by `hydrate_selection()` every time `entries` is rebuilt (`load_dir`/
+  `load_cache_candidates`); don't treat `Entry.selected` as authoritative. `delete_candidates()` returns
+  `selection` if non-empty, else the cursor's current entry (single-item quick delete). Pressing `d`
+  snapshots the result into `pending_delete`, which both the review screen (`draw_delete_review`, shown in
+  place of the normal list while `Mode::ConfirmDelete` is active) and `start_delete()` read from — this
+  keeps what's shown and what's deleted guaranteed identical even if `selection` changes while the
+  confirm prompt is up. `start_delete()` clears `selection` immediately (not after the background thread
+  finishes) since the batch is considered resolved once confirmed.
+- Deletion (`d`) always goes through the `ConfirmDelete` review screen before calling
+  `fs::remove_file`/`fs::remove_dir_all` on a background thread (`start_delete`/`poll_delete`).
 - **Cache cleaner (`c`)**: `ViewKind::Clean(CacheCategory)` repurposes the same `entries`/selection/delete
   pipeline to list known cache/temp locations instead of a directory's children. Candidate paths (per-OS,
   `src/cache_paths.rs`) are just best-effort guesses filtered by `path.exists()`, so listing a path that's
