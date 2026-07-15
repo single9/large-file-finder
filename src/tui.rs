@@ -526,7 +526,22 @@ impl App {
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.go_parent(),
             KeyCode::Char(' ') => self.toggle_select(),
             KeyCode::Char('d') | KeyCode::Delete => {
-                if self.delete_progress.is_none() && !self.entries_to_delete().is_empty() {
+                if self.delete_progress.is_some() {
+                    return;
+                }
+                let indices = self.entries_to_delete();
+                if indices.is_empty() {
+                    return;
+                }
+                if let Some(&i) = indices
+                    .iter()
+                    .find(|&&i| crate::cache_paths::is_protected_path(&self.entries[i].path))
+                {
+                    self.status = format!(
+                        "refused: \"{}\" is a protected system location and cannot be removed",
+                        self.entries[i].name
+                    );
+                } else {
                     self.mode = Mode::ConfirmDelete;
                 }
             }
@@ -709,9 +724,10 @@ impl App {
         let mut blocked = 0;
         for &i in &indices {
             let e = &self.entries[i];
-            // A filesystem root has no parent; never allow it to be deleted,
-            // regardless of how its path was constructed.
-            if e.path.parent().is_none() {
+            // Belt-and-suspenders: the 'd' key handler already refuses to
+            // enter ConfirmDelete for a protected path, but never delete one
+            // here either, regardless of how a target path was constructed.
+            if crate::cache_paths::is_protected_path(&e.path) {
                 blocked += 1;
                 continue;
             }
@@ -720,7 +736,7 @@ impl App {
         let total = targets.len();
         if total == 0 {
             if blocked > 0 {
-                self.status = "refused to delete a filesystem root".to_string();
+                self.status = "refused to delete a protected system location".to_string();
             }
             return;
         }
@@ -846,16 +862,26 @@ impl App {
                     ),
                     Size::Denied => ("no access".to_string(), Style::default().fg(Color::Red)),
                 };
-                let name_style = if matches!(e.size, Size::Denied) {
+                let protected = crate::cache_paths::is_protected_path(&e.path);
+                let name_style = if protected {
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else if matches!(e.size, Size::Denied) {
                     Style::default().fg(Color::Red)
                 } else if e.is_dir {
                     Style::default().fg(Color::Cyan)
                 } else {
                     Style::default()
                 };
+                let name = if protected {
+                    format!("🔒 {} (protected, cannot remove)", e.name)
+                } else {
+                    e.name.clone()
+                };
                 Row::new(vec![
                     Cell::from(format!("{mark} {icon}")),
-                    Cell::from(e.name.clone()).style(name_style),
+                    Cell::from(name).style(name_style),
                     Cell::from(Line::from(size_text).alignment(Alignment::Right)).style(size_style),
                 ])
             })

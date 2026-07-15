@@ -24,13 +24,17 @@ fn local_app_data() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
 }
 
-/// Rejects candidate paths that would be catastrophic to offer for deletion:
-/// relative paths (a sign the source env var was empty), filesystem roots
-/// (`path.parent()` is `None` on both Unix `/` and Windows `C:\`), and the
-/// home directory itself. `std::env::temp_dir()` in particular is used
-/// unvalidated and returns exactly these values when `$TMPDIR` is empty or
-/// set to `/`.
-fn is_dangerous_candidate(path: &Path) -> bool {
+/// True for paths that would be catastrophic to delete: relative paths (a
+/// sign the source env var was empty), filesystem roots (`path.parent()` is
+/// `None` on both Unix `/` and Windows `C:\`), and the home directory
+/// itself. `std::env::temp_dir()` in particular is used unvalidated in
+/// `system_cache_candidates` below and returns exactly these values when
+/// `$TMPDIR` is empty or set to `/`.
+///
+/// Used both to filter cache candidates before they're ever listed, and by
+/// the TUI to warn about (and refuse) deleting a protected path a user
+/// reaches through ordinary directory browsing.
+pub fn is_protected_path(path: &Path) -> bool {
     if !path.is_absolute() || path.parent().is_none() {
         return true;
     }
@@ -114,7 +118,7 @@ pub fn ai_cache_candidates() -> Vec<CacheEntry> {
         });
     }
 
-    v.retain(|c| !is_dangerous_candidate(&c.path));
+    v.retain(|c| !is_protected_path(&c.path));
     v
 }
 
@@ -165,6 +169,6 @@ pub fn system_cache_candidates() -> Vec<CacheEntry> {
         });
     }
 
-    v.retain(|c| !is_dangerous_candidate(&c.path));
+    v.retain(|c| !is_protected_path(&c.path));
     v
 }
