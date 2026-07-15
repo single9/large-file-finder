@@ -1,3 +1,4 @@
+mod cache_paths;
 mod tui;
 
 use std::path::PathBuf;

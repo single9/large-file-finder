@@ -33,6 +33,13 @@ min-size filter), `-n/--limit` (`--list` mode only), `--follow-links`, `--list`.
 - Deletion (`d`) targets the selection set if non-empty, otherwise falls back to the entry under the
   cursor (`entries_to_delete`), and always goes through a `ConfirmDelete` mode before calling
   `fs::remove_file`/`fs::remove_dir_all`.
+- **Cache cleaner (`c`)**: `ViewKind::Clean(CacheCategory)` repurposes the same `entries`/selection/delete
+  pipeline to list known cache/temp locations instead of a directory's children. Candidate paths (per-OS,
+  `src/cache_paths.rs`) are just best-effort guesses filtered by `path.exists()`, so listing a path that's
+  wrong for the current OS/toolset is harmless — it's simply absent. `Esc`/`h` from this view calls
+  `leave_clean_view()` to return to `ViewKind::Explorer`; `refresh_view()` dispatches `r`/post-delete
+  reloads to either `load_dir()` or `load_cache_candidates()` depending on the active view — don't call
+  `load_dir()` directly from view-agnostic code paths or it'll silently switch back to Explorer content.
 
 ## Commands
 

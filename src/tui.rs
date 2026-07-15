@@ -32,6 +32,26 @@ enum Size {
     Denied,
 }
 
+/// Progress updates from a background deletion, so the UI can show what's
+/// happening instead of freezing on a large `remove_dir_all`.
+enum DeleteMsg {
+    Progress {
+        done: usize,
+        total: usize,
+        name: String,
+    },
+    Finished {
+        deleted: usize,
+        failed: usize,
+    },
+}
+
+struct DeleteProgress {
+    done: usize,
+    total: usize,
+    name: String,
+}
+
 struct Entry {
     name: String,
     path: PathBuf,
@@ -53,6 +73,38 @@ enum Mode {
     MinSize,
     GotoPath,
     ConfirmDelete,
+    CleanMenu,
+    Help,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CacheCategory {
+    Ai,
+    System,
+}
+
+impl CacheCategory {
+    const ALL: [CacheCategory; 2] = [CacheCategory::Ai, CacheCategory::System];
+
+    fn label(self) -> &'static str {
+        match self {
+            CacheCategory::Ai => "AI Caches",
+            CacheCategory::System => "System Caches",
+        }
+    }
+
+    fn candidates(self) -> Vec<crate::cache_paths::CacheEntry> {
+        match self {
+            CacheCategory::Ai => crate::cache_paths::ai_cache_candidates(),
+            CacheCategory::System => crate::cache_paths::system_cache_candidates(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ViewKind {
+    Explorer,
+    Clean(CacheCategory),
 }
 
 /// Sends directory paths to a fixed pool of worker threads and receives their
@@ -154,6 +206,10 @@ struct App {
     size_cache: HashMap<PathBuf, DirSize>,
     quit: bool,
     spinner_tick: usize,
+    view: ViewKind,
+    clean_menu_cursor: usize,
+    delete_rx: Option<Receiver<DeleteMsg>>,
+    delete_progress: Option<DeleteProgress>,
 }
 
 impl App {
@@ -175,6 +231,10 @@ impl App {
             size_cache: HashMap::new(),
             quit: false,
             spinner_tick: 0,
+            view: ViewKind::Explorer,
+            clean_menu_cursor: 0,
+            delete_rx: None,
+            delete_progress: None,
         };
         app.load_dir();
         app
@@ -237,6 +297,71 @@ impl App {
 
         self.sort_entries();
         self.apply_filter();
+    }
+
+    fn load_cache_candidates(&mut self, category: CacheCategory) {
+        self.entries.clear();
+        self.cursor = 0;
+
+        let mut seen = std::collections::HashSet::new();
+        for candidate in category.candidates() {
+            if !candidate.path.exists() {
+                continue;
+            }
+            let canon = candidate
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.path.clone());
+            if !seen.insert(canon.clone()) {
+                continue;
+            }
+
+            let is_dir = canon.is_dir();
+            let size = if is_dir {
+                if let Some(cached) = self.size_cache.get(&canon) {
+                    dir_size_to_size(*cached)
+                } else {
+                    self.scanner.request(canon.clone());
+                    Size::Pending
+                }
+            } else {
+                match fs::metadata(&canon) {
+                    Ok(meta) => Size::Known(meta.len()),
+                    Err(_) => Size::Denied,
+                }
+            };
+
+            self.entries.push(Entry {
+                name: format!("{}  ({})", candidate.label, canon.display()),
+                path: canon,
+                is_dir,
+                size,
+                selected: false,
+            });
+        }
+
+        self.sort_entries();
+        self.apply_filter();
+    }
+
+    fn open_clean_view(&mut self, category: CacheCategory) {
+        self.view = ViewKind::Clean(category);
+        self.mode = Mode::Normal;
+        self.filter.clear();
+        self.load_cache_candidates(category);
+    }
+
+    fn leave_clean_view(&mut self) {
+        self.view = ViewKind::Explorer;
+        self.filter.clear();
+        self.load_dir();
+    }
+
+    fn refresh_view(&mut self) {
+        match self.view {
+            ViewKind::Explorer => self.load_dir(),
+            ViewKind::Clean(category) => self.load_cache_candidates(category),
+        }
     }
 
     fn sort_entries(&mut self) {
@@ -317,6 +442,7 @@ impl App {
     fn run(mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.quit {
             self.poll_sizes();
+            self.poll_delete();
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
             terminal.draw(|f| self.draw(f))?;
 
@@ -337,13 +463,26 @@ impl App {
             Mode::MinSize => self.handle_text_input_key(code, TextTarget::MinSize),
             Mode::GotoPath => self.handle_text_input_key(code, TextTarget::GotoPath),
             Mode::ConfirmDelete => self.handle_confirm_key(code),
+            Mode::CleanMenu => self.handle_clean_menu_key(code),
+            Mode::Help => {
+                if matches!(code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
+                    self.mode = Mode::Normal;
+                }
+            }
         }
     }
 
     fn handle_normal_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc => {
+                if matches!(self.view, ViewKind::Clean(_)) {
+                    self.leave_clean_view();
+                } else {
+                    self.quit = true;
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
@@ -358,7 +497,7 @@ impl App {
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.go_parent(),
             KeyCode::Char(' ') => self.toggle_select(),
             KeyCode::Char('d') | KeyCode::Delete => {
-                if !self.entries_to_delete().is_empty() {
+                if self.delete_progress.is_none() && !self.entries_to_delete().is_empty() {
                     self.mode = Mode::ConfirmDelete;
                 }
             }
@@ -374,6 +513,11 @@ impl App {
                 self.mode = Mode::GotoPath;
                 self.input = self.current_dir.to_string_lossy().into_owned();
             }
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('c') => {
+                self.mode = Mode::CleanMenu;
+                self.clean_menu_cursor = 0;
+            }
             KeyCode::Char('s') => {
                 self.sort_mode = match self.sort_mode {
                     SortMode::SizeDesc => SortMode::SizeAsc,
@@ -384,9 +528,40 @@ impl App {
                 self.apply_filter();
             }
             KeyCode::Char('r') => {
-                self.size_cache
-                    .retain(|p, _| !p.starts_with(&self.current_dir));
-                self.load_dir();
+                match self.view {
+                    ViewKind::Explorer => {
+                        self.size_cache
+                            .retain(|p, _| !p.starts_with(&self.current_dir));
+                    }
+                    ViewKind::Clean(_) => {
+                        for entry in &self.entries {
+                            self.size_cache.remove(&entry.path);
+                        }
+                    }
+                }
+                self.refresh_view();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_clean_menu_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.clean_menu_cursor > 0 {
+                    self.clean_menu_cursor -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.clean_menu_cursor + 1 < CacheCategory::ALL.len() {
+                    self.clean_menu_cursor += 1;
+                }
+            }
+            KeyCode::Char('1') => self.open_clean_view(CacheCategory::Ai),
+            KeyCode::Char('2') => self.open_clean_view(CacheCategory::System),
+            KeyCode::Enter => {
+                self.open_clean_view(CacheCategory::ALL[self.clean_menu_cursor]);
             }
             _ => {}
         }
@@ -398,12 +573,17 @@ impl App {
         };
         if entry.is_dir && !matches!(entry.size, Size::Denied) {
             self.current_dir = entry.path.clone();
+            self.view = ViewKind::Explorer;
             self.filter.clear();
             self.load_dir();
         }
     }
 
     fn go_parent(&mut self) {
+        if matches!(self.view, ViewKind::Clean(_)) {
+            self.leave_clean_view();
+            return;
+        }
         if let Some(parent) = self.current_dir.parent() {
             let child = self.current_dir.clone();
             self.current_dir = parent.to_path_buf();
@@ -483,35 +663,79 @@ impl App {
     fn handle_confirm_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.delete_selected();
+                self.start_delete();
                 self.mode = Mode::Normal;
             }
             _ => self.mode = Mode::Normal,
         }
     }
 
-    fn delete_selected(&mut self) {
+    fn start_delete(&mut self) {
         let indices = self.entries_to_delete();
-        let mut deleted = 0;
-        let mut failed = 0;
-        for &i in &indices {
-            let entry = &self.entries[i];
-            let result = if entry.is_dir {
-                fs::remove_dir_all(&entry.path)
-            } else {
-                fs::remove_file(&entry.path)
-            };
-            match result {
-                Ok(()) => deleted += 1,
-                Err(_) => failed += 1,
+        let targets: Vec<(PathBuf, bool, String)> = indices
+            .iter()
+            .map(|&i| {
+                let e = &self.entries[i];
+                (e.path.clone(), e.is_dir, e.name.clone())
+            })
+            .collect();
+        let total = targets.len();
+        if total == 0 {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut deleted = 0;
+            let mut failed = 0;
+            for (done, (path, is_dir, name)) in targets.into_iter().enumerate() {
+                let _ = tx.send(DeleteMsg::Progress { done, total, name });
+                let result = if is_dir {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                match result {
+                    Ok(()) => deleted += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+            let _ = tx.send(DeleteMsg::Finished { deleted, failed });
+        });
+
+        self.delete_rx = Some(rx);
+        self.delete_progress = Some(DeleteProgress {
+            done: 0,
+            total,
+            name: String::new(),
+        });
+    }
+
+    fn poll_delete(&mut self) {
+        let Some(rx) = &self.delete_rx else {
+            return;
+        };
+
+        let mut finished = None;
+        for msg in rx.try_iter() {
+            match msg {
+                DeleteMsg::Progress { done, total, name } => {
+                    self.delete_progress = Some(DeleteProgress { done, total, name });
+                }
+                DeleteMsg::Finished { deleted, failed } => finished = Some((deleted, failed)),
             }
         }
-        self.status = if failed == 0 {
-            format!("deleted {deleted} item(s)")
-        } else {
-            format!("deleted {deleted} item(s), {failed} failed")
-        };
-        self.load_dir();
+
+        if let Some((deleted, failed)) = finished {
+            self.delete_rx = None;
+            self.delete_progress = None;
+            self.status = if failed == 0 {
+                format!("deleted {deleted} item(s)")
+            } else {
+                format!("deleted {deleted} item(s), {failed} failed")
+            };
+            self.refresh_view();
+        }
     }
 
     fn draw(&self, f: &mut Frame) {
@@ -525,15 +749,22 @@ impl App {
         .split(area);
 
         self.draw_header(f, layout[0]);
-        self.draw_list(f, layout[1]);
+        match self.mode {
+            Mode::CleanMenu => self.draw_clean_menu(f, layout[1]),
+            Mode::Help => self.draw_help(f, layout[1]),
+            _ => self.draw_list(f, layout[1]),
+        }
         self.draw_status(f, layout[2]);
         self.draw_footer(f, layout[3]);
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
-        let path_text = match self.mode {
-            Mode::GotoPath => format!("go to: {}", self.input),
-            _ => format!("path: {}", self.current_dir.display()),
+        let path_text = match (&self.mode, self.view) {
+            (Mode::GotoPath, _) => format!("go to: {}", self.input),
+            (_, ViewKind::Clean(category)) => {
+                format!("{} — review items, then select & delete", category.label())
+            }
+            (_, ViewKind::Explorer) => format!("path: {}", self.current_dir.display()),
         };
 
         let pending = self.pending_count();
@@ -612,11 +843,94 @@ impl App {
         f.render_stateful_widget(table, area, &mut state);
     }
 
+    fn draw_clean_menu(&self, f: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = CacheCategory::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, category)| {
+                let marker = if i == self.clean_menu_cursor {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if i == self.clean_menu_cursor {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(format!("{marker}{}", category.label()), style))
+            })
+            .collect();
+
+        let block = Block::default().borders(Borders::ALL).title(
+            "Clear caches & temp files — pick a category (↑/↓ + enter, or 1/2, Esc to cancel)",
+        );
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn draw_help(&self, f: &mut Frame, area: Rect) {
+        const GROUPS: &[(&str, &[(&str, &str)])] = &[
+            (
+                "Navigate",
+                &[
+                    ("↑/↓, j/k", "move"),
+                    ("→, enter, l", "open directory"),
+                    ("←, backspace, h", "up / back"),
+                    ("g", "go to path"),
+                ],
+            ),
+            (
+                "Find",
+                &[("/", "filter by name"), ("m", "filter by min size")],
+            ),
+            (
+                "Select & remove",
+                &[("space", "select"), ("d, delete", "delete selection")],
+            ),
+            (
+                "View",
+                &[
+                    ("s", "cycle sort"),
+                    ("r", "refresh"),
+                    ("c", "clean caches & temp files"),
+                ],
+            ),
+            (
+                "Other",
+                &[("?", "toggle this help"), ("q, esc", "quit / back")],
+            ),
+        ];
+
+        let mut lines = Vec::new();
+        for (group, bindings) in GROUPS {
+            lines.push(Line::from(Span::styled(
+                *group,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for (keys, desc) in *bindings {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {keys:<18}"), Style::default().fg(Color::Yellow)),
+                    Span::raw(*desc),
+                ]));
+            }
+            lines.push(Line::raw(""));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Keyboard shortcuts (Esc/? to close)");
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let text = match self.mode {
             Mode::Filter => format!("filter> {}", self.input),
             Mode::MinSize => format!("min size (e.g. 10M)> {}", self.input),
             Mode::GotoPath => String::new(),
+            Mode::CleanMenu => String::new(),
+            Mode::Help => String::new(),
             Mode::ConfirmDelete => {
                 let indices = self.entries_to_delete();
                 let total: u64 = indices
@@ -631,6 +945,21 @@ impl App {
             }
             Mode::Normal => self.status.clone(),
         };
+
+        if let Some(progress) = &self.delete_progress {
+            const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+            let frame = SPINNER[self.spinner_tick % SPINNER.len()];
+            let text = format!(
+                "{frame} deleting {}/{}: {}…",
+                (progress.done + 1).min(progress.total),
+                progress.total,
+                progress.name
+            );
+            let style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+            f.render_widget(Paragraph::new(text).style(style), area);
+            return;
+        }
+
         let style = if matches!(self.mode, Mode::ConfirmDelete) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         } else {
@@ -640,8 +969,7 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let help = "↑/↓ move  →/enter open  ←/backspace up  space select  \
-                     d delete  / filter  m min-size  g goto  s sort  r refresh  q quit";
+        let help = "↑/↓ move  enter open  space select  d delete  ? help  q quit";
         f.render_widget(
             Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
             area,
