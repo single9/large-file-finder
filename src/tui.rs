@@ -116,6 +116,26 @@ impl CacheCategory {
 enum ViewKind {
     Explorer,
     Clean(CacheCategory),
+    /// Windows only: list of mounted drive letters, shown when backing out
+    /// of a drive root (which has no filesystem parent) or via the `D` key.
+    Drives,
+}
+
+/// Mounted drive roots (e.g. `C:\`, `D:\`) on Windows; empty everywhere else,
+/// since other platforms have a single filesystem root with no drive concept.
+#[cfg(windows)]
+fn windows_drives() -> Vec<PathBuf> {
+    (b'A'..=b'Z')
+        .filter_map(|letter| {
+            let path = PathBuf::from(format!("{}:\\", letter as char));
+            path.is_dir().then_some(path)
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn windows_drives() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// Sends directory paths to a fixed pool of worker threads and receives their
@@ -389,10 +409,47 @@ impl App {
         self.load_dir();
     }
 
+    fn leave_drives_view(&mut self) {
+        self.view = ViewKind::Explorer;
+        self.filter.clear();
+        self.load_dir();
+    }
+
+    /// Populates `entries` with mounted drive letters instead of a
+    /// directory's children, reusing the same list/select/enter pipeline as
+    /// `load_dir` so picking a drive is just "open directory" on a drive
+    /// root entry.
+    fn load_drives(&mut self) {
+        self.entries.clear();
+        self.cursor = 0;
+
+        for path in windows_drives() {
+            let name = path.to_string_lossy().into_owned();
+            let size = if let Some(cached) = self.size_cache.get(&path) {
+                dir_size_to_size(*cached)
+            } else {
+                self.scanner.request(path.clone());
+                Size::Pending
+            };
+            self.entries.push(Entry {
+                name,
+                path,
+                is_dir: true,
+                size,
+                selected: false,
+            });
+        }
+
+        self.hydrate_selection();
+        self.sort_entries();
+        self.apply_filter();
+    }
+
     fn refresh_view(&mut self) {
         match self.view {
             ViewKind::Explorer => self.load_dir(),
             ViewKind::Clean(category) => self.load_cache_candidates(category),
+            ViewKind::Drives => self.load_drives(),
         }
     }
 
@@ -547,6 +604,8 @@ impl App {
             KeyCode::Esc => {
                 if matches!(self.view, ViewKind::Clean(_)) {
                     self.leave_clean_view();
+                } else if matches!(self.view, ViewKind::Drives) {
+                    self.leave_drives_view();
                 } else {
                     self.quit = true;
                 }
@@ -597,6 +656,11 @@ impl App {
                 self.mode = Mode::GotoPath;
                 self.input = self.current_dir.to_string_lossy().into_owned();
             }
+            KeyCode::Char('D') if cfg!(windows) => {
+                self.view = ViewKind::Drives;
+                self.filter.clear();
+                self.load_drives();
+            }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('c') => {
                 self.mode = Mode::CleanMenu;
@@ -620,7 +684,7 @@ impl App {
                         self.size_cache
                             .retain(|p, _| !p.starts_with(&self.current_dir));
                     }
-                    ViewKind::Clean(_) => {
+                    ViewKind::Clean(_) | ViewKind::Drives => {
                         for entry in &self.entries {
                             self.size_cache.remove(&entry.path);
                         }
@@ -672,6 +736,9 @@ impl App {
             self.leave_clean_view();
             return;
         }
+        if matches!(self.view, ViewKind::Drives) {
+            return;
+        }
         if let Some(parent) = self.current_dir.parent() {
             let child = self.current_dir.clone();
             self.current_dir = parent.to_path_buf();
@@ -684,6 +751,12 @@ impl App {
             {
                 self.cursor = pos;
             }
+        } else if cfg!(windows) {
+            // Drive roots (e.g. `C:\`) have no filesystem parent — offer a
+            // drive picker instead of doing nothing.
+            self.view = ViewKind::Drives;
+            self.filter.clear();
+            self.load_drives();
         }
     }
 
@@ -884,6 +957,7 @@ impl App {
             (_, ViewKind::Clean(category)) => {
                 format!("{} — review items, then select & delete", category.label())
             }
+            (_, ViewKind::Drives) => "select a drive".to_string(),
             (_, ViewKind::Explorer) => format!("path: {}", self.current_dir.display()),
         };
 
@@ -1053,6 +1127,7 @@ impl App {
                     ("→, enter, l", "open directory"),
                     ("←, backspace, h", "up / back"),
                     ("g", "go to path"),
+                    ("D", "list drives (Windows)"),
                 ],
             ),
             (
